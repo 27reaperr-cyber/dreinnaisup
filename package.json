@@ -1,0 +1,19 @@
+{
+  "name": "dreinn-vpn-bot",
+  "version": "1.0.0",
+  "description": "Dreinn VPN — Telegram Business AI Support Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "better-sqlite3": "^9.6.0",
+    "dotenv": "^16.4.7",
+    "telegraf": "^4.16.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
