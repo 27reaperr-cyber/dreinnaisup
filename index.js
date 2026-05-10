@@ -111,12 +111,21 @@ async function fetchAIResponse(userId, userText) {
     { headers, timeout: 30_000 }
   );
 
-  return (
-    data?.choices?.[0]?.message?.content ||
-    data?.message?.content ||
-    data?.content ||
-    'Не удалось получить ответ от ИИ.'
-  );
+  // OnlySq v2 оборачивает ответ в поле `answer` (OpenAI-совместимый объект)
+  const answer =
+    data?.answer?.choices?.[0]?.message?.content ??
+    data?.choices?.[0]?.message?.content         ??
+    data?.answer?.content                         ??
+    data?.message?.content                        ??
+    data?.content                                 ??
+    null;
+
+  if (!answer) {
+    console.error('[AI] Неожиданный формат ответа:', JSON.stringify(data).slice(0, 500));
+    throw new Error('Неожиданный формат ответа от OnlySq API');
+  }
+
+  return answer;
 }
 
 async function fetchModels() {
@@ -254,9 +263,27 @@ bot.on('callback_query', async (ctx) => {
   if (data === 'a:models') {
     try {
       const raw = await fetchModels();
-      const list = Array.isArray(raw)
-        ? raw.slice(0, 30).map((m) => `• <code>${m?.id ?? m?.name ?? String(m)}</code>`).join('\n')
-        : `<pre>${JSON.stringify(raw, null, 2).slice(0, 3000)}</pre>`;
+
+      // Извлекаем только ID/name из любой структуры ответа
+      let modelIds = [];
+      if (Array.isArray(raw)) {
+        modelIds = raw.map((m) => {
+          if (typeof m === 'string') return m;
+          return m?.id ?? m?.name ?? m?.model ?? JSON.stringify(m);
+        }).filter(Boolean);
+      } else if (raw?.data && Array.isArray(raw.data)) {
+        // OpenAI-совместимый формат: { data: [ { id: "..." }, ... ] }
+        modelIds = raw.data.map((m) => m?.id ?? m?.name ?? String(m)).filter(Boolean);
+      } else if (raw?.models && Array.isArray(raw.models)) {
+        modelIds = raw.models.map((m) => m?.id ?? m?.name ?? String(m)).filter(Boolean);
+      } else {
+        // Последний шанс — вытащить строки рекурсивно
+        modelIds = extractStrings(raw).slice(0, 40);
+      }
+
+      const list = modelIds.slice(0, 40)
+        .map((id) => `• <code>${escapeHtml(String(id))}</code>`)
+        .join('\n') || '<i>Список пуст</i>';
 
       return ctx.editMessageText(
         `<tg-emoji emoji-id="6030400221232501136">🤖</tg-emoji> <b>Доступные модели OnlySq</b>\n\n${list}`,
@@ -264,7 +291,7 @@ bot.on('callback_query', async (ctx) => {
       );
     } catch (e) {
       return ctx.editMessageText(
-        `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Ошибка: <code>${e.message}</code>`,
+        `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Ошибка: <code>${escapeHtml(e.message)}</code>`,
         { parse_mode: 'HTML', reply_markup: backKeyboard() }
       );
     }
@@ -447,12 +474,14 @@ bot.on('business_message', async (ctx) => {
   // ── Нет текста (стикер, медиа без caption) ────────────────────────────────
   if (!text) return;
 
-  // ── Индикатор набора ──────────────────────────────────────────────────────
+  // ── Индикатор набора (через прямой Bot API вызов, Telegraf не прокидывает business_connection_id в sendChatAction) ──
   try {
-    await ctx.telegram.sendChatAction(chatId, 'typing', {
+    await ctx.telegram.callApi('sendChatAction', {
+      chat_id: chatId,
+      action: 'typing',
       business_connection_id: bizConnId,
     });
-  } catch (_) {}
+  } catch (_) { /* не критично */ }
 
   // ── Запрос к ИИ ──────────────────────────────────────────────────────────
   try {
@@ -465,12 +494,31 @@ bot.on('business_message', async (ctx) => {
       `<i><tg-emoji emoji-id="6028435952299413210">ℹ️</tg-emoji> Не помогло? Напишите /disable для связи с оператором.</i>`
     );
   } catch (err) {
-    console.error('[AI error]', err?.response?.data ?? err.message);
+    const errData = err?.response?.data ?? err?.message ?? String(err);
+    console.error('[AI error]', errData);
 
+    // Проверяем — если ошибка в авторизации OnlySq, не спамим пользователя
+    const isAuthError = err?.response?.status === 401 ||
+      String(errData).toLowerCase().includes('api key') ||
+      String(errData).toLowerCase().includes('authentication');
+
+    if (isAuthError) {
+      // Уведомляем только админа
+      await ctx.telegram.sendMessage(
+        ADMIN_ID,
+        `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> <b>Ошибка авторизации OnlySq!</b>\n\n` +
+        `Проверьте <code>ONLYSQ_API_KEY</code> в файле <code>.env</code>\n` +
+        `Получить ключ: https://my.onlysq.ru`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+      return;
+    }
+
+    // Для прочих ошибок — сообщаем пользователю
     await sendBusiness(ctx, chatId, bizConnId,
-      `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> <b>Ошибка ИИ-помощника.</b>\n\n` +
+      `<tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> <b>Не удалось получить ответ.</b>\n\n` +
       `Попробуйте ещё раз или напишите /disable для связи с оператором.`
-    );
+    ).catch((e) => console.error('[sendBusiness error]', e.message));
   }
 });
 
@@ -489,7 +537,33 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;');
 }
 
+// Рекурсивно собирает строки из произвольного JSON-объекта (для парсинга моделей)
+function extractStrings(obj, depth = 0) {
+  if (depth > 4) return [];
+  if (typeof obj === 'string') return [obj];
+  if (Array.isArray(obj)) return obj.flatMap((v) => extractStrings(v, depth + 1));
+  if (obj && typeof obj === 'object') {
+    // Приоритет: поля id, name, model
+    const priority = ['id', 'name', 'model'];
+    const result = [];
+    for (const key of priority) {
+      if (typeof obj[key] === 'string') result.push(obj[key]);
+    }
+    if (result.length) return result;
+    return Object.values(obj).flatMap((v) => extractStrings(v, depth + 1));
+  }
+  return [];
+}
+
 // ─── Launch ───────────────────────────────────────────────────────────────────
+
+// Глобальный перехват ошибок — чтобы бот не крашился на необработанных апдейтах
+bot.catch((err, ctx) => {
+  const code    = err?.response?.error_code ?? err?.status ?? '—';
+  const desc    = err?.response?.description ?? err?.message ?? String(err);
+  console.error(`[bot.catch] ${code}: ${desc}`, ctx?.updateType ?? '');
+});
+
 bot.launch({
   allowedUpdates: [
     'message',
